@@ -10,7 +10,7 @@ DB_PATH = Path(__file__).parent / "ideas.db"
 
 
 def init_db() -> None:
-    """Создаёт таблицу, если её ещё нет."""
+    """Создаёт таблицу, если её ещё нет, и накатывает недостающие колонки."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -21,10 +21,14 @@ def init_db() -> None:
                 full_name TEXT,
                 text TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'new',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reason TEXT
             )
             """
         )
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(ideas)")}
+        if "reason" not in existing_columns:
+            conn.execute("ALTER TABLE ideas ADD COLUMN reason TEXT")
         conn.commit()
 
 
@@ -59,11 +63,12 @@ def get_idea(idea_id: int) -> sqlite3.Row | None:
         return cur.fetchone()
 
 
-def set_status(idea_id: int, status: str) -> bool:
-    """status: new / approved / rejected"""
+def set_status(idea_id: int, status: str, reason: str | None = None) -> bool:
+    """status: new / approved / rejected. reason — причина отказа (опционально)."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "UPDATE ideas SET status = ? WHERE id = ?", (status, idea_id)
+            "UPDATE ideas SET status = ?, reason = ? WHERE id = ?",
+            (status, reason, idea_id),
         )
         conn.commit()
         return cur.rowcount > 0
