@@ -3,8 +3,10 @@ import logging
 import os
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 import db
@@ -22,6 +24,28 @@ router = Router()
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+class IdeaCallback(CallbackData, prefix="idea"):
+    action: str
+    idea_id: int
+
+
+def idea_keyboard(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=IdeaCallback(action="approve", idea_id=idea_id).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=IdeaCallback(action="reject", idea_id=idea_id).pack(),
+                ),
+            ]
+        ]
+    )
 
 
 @router.message(CommandStart())
@@ -88,49 +112,56 @@ async def cmd_pending(message: Message) -> None:
     if not ideas:
         await message.answer("Новых идей нет.")
         return
-    lines = ["🕓 Идеи на рассмотрении:\n"]
     for idea in ideas:
         who = f"@{idea['username']}" if idea["username"] else idea["full_name"]
-        lines.append(f"#{idea['id']} от {who}\n{idea['text']}\n")
-    await message.answer("\n".join(lines))
+        await message.answer(
+            f"#{idea['id']} от {who}\n\n{idea['text']}",
+            reply_markup=idea_keyboard(idea["id"]),
+        )
 
 
-async def _change_status(message: Message, status: str) -> None:
-    if not is_admin(message.from_user.id):
+@router.callback_query(IdeaCallback.filter(F.action.in_({"approve", "reject"})))
+async def cb_idea_action(query: CallbackQuery, callback_data: IdeaCallback, bot: Bot) -> None:
+    if not is_admin(query.from_user.id):
+        await query.answer("У тебя нет прав на это действие.", show_alert=True)
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.answer("Использование: /approve <id> или /reject <id>")
-        return
 
-    idea_id = int(parts[1].strip())
+    idea_id = callback_data.idea_id
     idea = db.get_idea(idea_id)
     if idea is None:
-        await message.answer(f"Идея #{idea_id} не найдена.")
+        await query.answer("Идея не найдена.", show_alert=True)
         return
 
+    if idea["status"] != "new":
+        already = "одобрена ✅" if idea["status"] == "approved" else "отклонена ❌"
+        await query.answer(f"Уже {already}", show_alert=True)
+        return
+
+    status = "approved" if callback_data.action == "approve" else "rejected"
     db.set_status(idea_id, status)
-    label = "✅ одобрена" if status == "approved" else "❌ отклонена"
-    await message.answer(f"Идея #{idea_id} {label}.")
+
+    label = "✅ Одобрено" if status == "approved" else "❌ Отклонено"
+    who = f"@{idea['username']}" if idea["username"] else idea["full_name"]
+
+    try:
+        await query.message.edit_text(
+            f"#{idea_id} от {who}\n\n{idea['text']}\n\n"
+            f"{label} (админ: {query.from_user.full_name})"
+        )
+    except TelegramBadRequest:
+        pass
+
+    await query.answer("Готово" if status == "approved" else "Отклонено")
 
     try:
         note = "одобрена ✅" if status == "approved" else "отклонена ❌"
-        await message.bot.send_message(
+        await bot.send_message(
             idea["user_id"],
             f"Твоя идея #{idea_id} была {note}\n\n«{idea['text'][:200]}»",
         )
     except Exception:
         logging.warning("Не удалось уведомить пользователя %s", idea["user_id"])
 
-
-@router.message(Command("approve"))
-async def cmd_approve(message: Message) -> None:
-    await _change_status(message, "approved")
-
-
-@router.message(Command("reject"))
-async def cmd_reject(message: Message) -> None:
-    await _change_status(message, "rejected")
 
 @router.message(F.text)
 async def handle_idea(message: Message) -> None:
@@ -149,15 +180,13 @@ async def handle_idea(message: Message) -> None:
         f"Спасибо! Идея #{idea_id} принята и отправлена на рассмотрение."
     )
 
-    # пересылаем всем админам
     who = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
     for admin_id in ADMIN_IDS:
         try:
             await message.bot.send_message(
                 admin_id,
-                f"💡 Новая идея #{idea_id} от {who}:\n\n{text}\n\n"
-                f"/approve {idea_id} — одобрить\n"
-                f"/reject {idea_id} — отклонить",
+                f"💡 Новая идея #{idea_id} от {who}:\n\n{text}",
+                reply_markup=idea_keyboard(idea_id),
             )
         except Exception:
             logging.warning("Не удалось отправить админу %s", admin_id)
